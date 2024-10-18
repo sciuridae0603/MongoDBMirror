@@ -293,7 +293,7 @@ def get_oplogs():
             g.source_db["local"]["oplog.rs"].find(
                 {
                     "ns": {"$in": list(g.mapping.keys())},
-                    "op": {"$in": ["i", "u", "d","n"]},
+                    "op": {"$in": ["i", "u", "d", "n"]},
                 },
             )
         )
@@ -385,30 +385,36 @@ def oplog_sync():
 def sync():
     logger.info("Starting sync")
 
-    for collection in g.mapping:
-        source_database = collection.split(".")[0]
-        source_collection = collection.split(".")[1]
-        destination_database = g.mapping[collection].split(".")[0]
-        destination_collection = g.mapping[collection].split(".")[1]
+    if g.config["sync"]["mirror_indexes"] == "true":
+        logger.info("Mirroring indexes")
 
-        mirror_indexes(
-            source_database,
-            source_collection,
-            destination_database,
-            destination_collection,
-        )
+        for collection in g.mapping:
+            source_database = collection.split(".")[0]
+            source_collection = collection.split(".")[1]
+            destination_database = g.mapping[collection].split(".")[0]
+            destination_collection = g.mapping[collection].split(".")[1]
 
-    logger.info("Indexes mirroring complete")
+            mirror_indexes(
+                source_database,
+                source_collection,
+                destination_database,
+                destination_collection,
+            )
 
-    read_last_oplog()
+        logger.info("Indexes mirroring complete")
+
+    if g.config["sync"]["mode"] != "full":
+        read_last_oplog()
 
     if g.config["sync"]["mode"] == "auto":
+        logger.info("Checking oplog is outdated or not")
         if oplog_outdated():
             logger.info("Oplog outdated, starting full sync")
             g.last_processed_oplog_timestamp = time.time() * 1000
             oplog_puller()
             full_sync()
         else:
+            logger.info("Oplog is up to date, starting oplog sync")
             oplog_puller()
         oplog_sync()
     if g.config["sync"]["mode"] == "full":

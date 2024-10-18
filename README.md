@@ -32,6 +32,8 @@ flag_perfix=mongodb_mirror_
 delete_documents_not_in_source=true
 # Interval for pulling oplog (in seconds)
 oplog_pull_interval=1
+# Enable mirror indexes
+mirror_indexes=true
 
 [mapping]
 # *=* : Sync all databases
