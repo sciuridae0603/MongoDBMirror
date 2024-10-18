@@ -292,6 +292,7 @@ def get_oplogs():
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
                 {
+                    "ns": {"$in": list(g.mapping.keys())},
                     "op": {"$in": ["i", "u", "d"]},
                 },
             )
@@ -326,10 +327,7 @@ def oplog_puller():
         while True:
             oplogs = get_oplogs()
             for oplog in oplogs:
-                if (
-                    not g.last_processed_oplog_timestamp
-                    or oplog["ts"] > g.last_processed_oplog_timestamp
-                ):
+                if oplog["ts"] > g.last_processed_oplog_timestamp:
                     g.oplog_sync_queue.put(oplog)
 
             g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
@@ -385,6 +383,8 @@ def oplog_sync():
 
 
 def sync():
+    logger.info("Starting sync")
+
     for collection in g.mapping:
         source_database = collection.split(".")[0]
         source_collection = collection.split(".")[1]
@@ -398,10 +398,13 @@ def sync():
             destination_collection,
         )
 
+    logger.info("Indexes mirroring complete")
+
     read_last_oplog()
 
     if g.config["sync"]["mode"] == "auto":
         if oplog_outdated():
+            logger.info("Oplog outdated, starting full sync")
             g.last_processed_oplog_timestamp = time.time() * 1000
             oplog_puller()
             full_sync()
