@@ -135,9 +135,14 @@ def mirror_indexes(
             logger.info(
                 f"Creating index {index} in {destination_database}.{destination_collection}"
             )
-            g.destination_db[destination_database][destination_collection].create_index(
-                source_indexes[index]["key"], name=index, **source_indexes[index]
-            )
+            try:
+                g.destination_db[destination_database][destination_collection].create_index(
+                    source_indexes[index]["key"], name=index, **source_indexes[index]
+                )
+            except pymongo.errors.OperationFailure as e:
+                logger.error(
+                    f"Error creating index {index} in {destination_database}.{destination_collection}: {e}"
+                )
         else:
             if (
                 len(jsondiff(source_indexes[index], destination_indexes[index]).keys())
