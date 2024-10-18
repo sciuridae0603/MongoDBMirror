@@ -136,7 +136,9 @@ def mirror_indexes(
                 f"Creating index {index} in {destination_database}.{destination_collection}"
             )
             try:
-                g.destination_db[destination_database][destination_collection].create_index(
+                g.destination_db[destination_database][
+                    destination_collection
+                ].create_index(
                     source_indexes[index]["key"], name=index, **source_indexes[index]
                 )
             except pymongo.errors.OperationFailure as e:
@@ -154,6 +156,17 @@ def mirror_indexes(
                 g.destination_db[destination_database][
                     destination_collection
                 ].drop_index(index)
+                
+                while True:
+                    if (
+                        not index
+                        in g.destination_db[destination_database][
+                            destination_collection
+                        ].index_information()
+                    ):
+                        break
+                    time.sleep(3)
+                    
                 g.destination_db[destination_database][
                     destination_collection
                 ].create_index(
@@ -317,7 +330,7 @@ def oplog_puller():
                     or oplog["ts"] > g.last_processed_oplog_timestamp
                 ):
                     g.oplog_sync_queue.put(oplog)
-                    
+
             g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
             save_last_oplog(oplogs[-1])
 
