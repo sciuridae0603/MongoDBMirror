@@ -51,7 +51,7 @@ def parse_args():
 def read_config(path):
     logger.info(f"Reading configuration from {path}")
     try:
-        g.config = configparser.ConfigParser()
+        g.config = configparser.RawConfigParser()
         g.config.read(path)
 
         g.flags.not_found_in_source = (
