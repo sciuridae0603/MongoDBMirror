@@ -156,7 +156,7 @@ def mirror_indexes(
                 g.destination_db[destination_database][
                     destination_collection
                 ].drop_index(index)
-                
+
                 while True:
                     if (
                         not index
@@ -166,7 +166,7 @@ def mirror_indexes(
                     ):
                         break
                     time.sleep(3)
-                    
+
                 g.destination_db[destination_database][
                     destination_collection
                 ].create_index(
@@ -291,8 +291,9 @@ def get_oplogs():
     try:
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
-                {},
-                cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+                {
+                    "op": {"$in": ["i", "u", "d"]},
+                },
             )
         )
         for oplog in oplogs:
