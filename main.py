@@ -57,6 +57,8 @@ def read_config(path):
         g.flags.not_found_in_source = (
             g.config["sync"]["flag_perfix"] + "not_found_in_source"
         )
+
+        logger.add(g.config["sync"]["log_file"])
     except Exception as e:
         logger.error(f"Error reading configuration file: {e}")
         logger.error(e)
@@ -181,6 +183,7 @@ def sync_worker():
         destination_collection = work["destination_collection"]
 
         count = 0
+        total = g.source_db[source_database][source_collection].count_documents({})
 
         logger.info(
             f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}"
@@ -203,7 +206,7 @@ def sync_worker():
 
             if count % 1000 == 0:
                 logger.info(
-                    f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} ({count} documents)"
+                    f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} ({count}/{total} documents)"
                 )
 
         if g.config["sync"]["delete_documents_not_in_source"] == "true":
@@ -300,7 +303,7 @@ def oplog_outdated():
 
 
 def oplog_puller():
-    def worker():
+    def oplog_puller_worker():
         while True:
             oplogs = get_oplogs()
             for oplog in oplogs:
@@ -309,13 +312,13 @@ def oplog_puller():
                     or oplog["ts"] > g.last_processed_oplog_timestamp
                 ):
                     g.oplog_sync_queue.put(oplog)
-
+                    
             g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
             save_last_oplog(oplogs[-1])
 
             time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
 
-    t = threading.Thread(target=worker)
+    t = threading.Thread(target=oplog_puller_worker)
     t.daemon = True
     t.start()
 
