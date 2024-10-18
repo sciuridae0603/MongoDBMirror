@@ -6,6 +6,7 @@ import sys
 import threading
 import queue
 import json
+from bson import Timestamp
 from jsondiff import diff as jsondiff
 from loguru import logger
 
@@ -292,8 +293,13 @@ def get_oplogs():
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
                 {
-                    "ns": {"$in": list(g.mapping.keys())},
+                    "ns": {"$in": list(g.mapping.keys()) + [""]},
                     "op": {"$in": ["i", "u", "d", "n"]},
+                    "ts": {
+                        "$gte": Timestamp(
+                            int((g.last_processed_oplog_timestamp / 1000) - 60), 0
+                        )
+                    },
                 },
             )
         )
@@ -310,10 +316,11 @@ def convert_bson_timestamp_to_milliseconds(timestamp):
 
 
 def oplog_outdated():
-    oplogs = get_oplogs()
-
     if g.last_processed_oplog_timestamp == None:
+        g.last_processed_oplog_timestamp = time.time() * 1000
         return True
+
+    oplogs = get_oplogs()
 
     for oplog in oplogs:
         if oplog["ts"] == g.last_processed_oplog_timestamp:
@@ -410,7 +417,6 @@ def sync():
         logger.info("Checking oplog is outdated or not")
         if oplog_outdated():
             logger.info("Oplog outdated, starting full sync")
-            g.last_processed_oplog_timestamp = time.time() * 1000
             oplog_puller()
             full_sync()
         else:
