@@ -293,7 +293,7 @@ def get_oplogs():
             g.source_db["local"]["oplog.rs"].find(
                 {
                     "ns": {"$in": list(g.mapping.keys())},
-                    "op": {"$in": ["i", "u", "d"]},
+                    "op": {"$in": ["i", "u", "d","n"]},
                 },
             )
         )
