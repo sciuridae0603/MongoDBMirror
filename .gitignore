@@ -1,0 +1,3 @@
+confs/*
+!confs/example.conf
+logs/*
