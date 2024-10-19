@@ -195,6 +195,8 @@ def sync_worker():
         if g.full_sync_queue.empty():
             break
 
+        failed_documents = []
+
         work = g.full_sync_queue.get()
         source_database = work["source_database"]
         source_collection = work["source_collection"]
@@ -216,11 +218,20 @@ def sync_worker():
 
         source_cursor = g.source_db[source_database][source_collection].find()
         for document in source_cursor:
-            g.destination_db[destination_database][destination_collection].replace_one(
-                {"_id": document["_id"]},
-                document,
-                upsert=True,
-            )
+            try:
+                g.destination_db[destination_database][
+                    destination_collection
+                ].replace_one(
+                    {"_id": document["_id"]},
+                    document,
+                    upsert=True,
+                )
+            except:
+                logger.error(
+                    f"Error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}, appending to failed documents list"
+                )
+                failed_documents.append(document)
+
             count += 1
 
             if count % 1000 == 0:
@@ -236,6 +247,25 @@ def sync_worker():
                 {},
                 {"$unset": {g.flags.not_found_in_source: ""}},
             )
+
+        if len(failed_documents) > 0:
+            logger.info(
+                f"Processing {source_database}.{source_collection} to {destination_database}.{destination_collection} failed documents"
+            )
+
+            for document in failed_documents:
+                try:
+                    g.destination_db[destination_database][
+                        destination_collection
+                    ].replace_one(
+                        {"_id": document["_id"]},
+                        document,
+                        upsert=True,
+                    )
+                except:
+                    logger.error(
+                        f"Still error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}"
+                    )
 
         g.full_sync_left_collections -= 1
         logger.info(
