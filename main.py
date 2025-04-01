@@ -323,12 +323,14 @@ def get_oplogs():
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
                 {
-                    "ns": {"$in": list(g.mapping.keys()) + [""]},
                     "op": {"$in": ["i", "u", "d", "n"]},
                     "ts": {
                         "$gte": Timestamp(
-                            int((g.last_processed_oplog_timestamp / 1000) - 60), 0
-                        )
+                            int((g.last_processed_oplog_timestamp / 1000) - 60 * 10), 0
+                        ),
+                        "$lte": Timestamp(
+                            int((g.last_processed_oplog_timestamp / 1000) + 60 * 10), 0
+                        ),
                     },
                 },
             )
@@ -376,8 +378,17 @@ def oplog_puller():
     t.daemon = True
     t.start()
 
-
+def oplog_monitor():
+    while True:
+        if not g.oplog_sync_queue.empty():
+            logger.info(f"Oplog Queue : {g.oplog_sync_queue.qsize()}")
+        time.sleep(1)
+        
 def oplog_sync():
+    monitor_thread = threading.Thread(target=oplog_monitor)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+
     while True:
         if g.oplog_sync_queue.empty():
             time.sleep(0.1)
