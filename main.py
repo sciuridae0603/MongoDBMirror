@@ -195,65 +195,32 @@ def sync_worker():
         if g.full_sync_queue.empty():
             break
 
-        failed_documents = []
-
         work = g.full_sync_queue.get()
-        source_database = work["source_database"]
-        source_collection = work["source_collection"]
-        destination_database = work["destination_database"]
-        destination_collection = work["destination_collection"]
+        
+        try:
+    
+            failed_documents = []
 
-        count = 0
-        total = g.source_db[source_database][source_collection].count_documents({})
+            source_database = work["source_database"]
+            source_collection = work["source_collection"]
+            destination_database = work["destination_database"]
+            destination_collection = work["destination_collection"]
 
-        logger.info(
-            f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}"
-        )
+            count = 0
+            total = g.source_db[source_database][source_collection].count_documents({})
 
-        if g.config["sync"]["delete_documents_not_in_source"] == "true":
-            g.destination_db[destination_database][destination_collection].update_many(
-                {},
-                {"$set": {g.flags.not_found_in_source: True}},
-            )
-
-        source_cursor = g.source_db[source_database][source_collection].find()
-        for document in source_cursor:
-            try:
-                g.destination_db[destination_database][
-                    destination_collection
-                ].replace_one(
-                    {"_id": document["_id"]},
-                    document,
-                    upsert=True,
-                )
-            except:
-                logger.error(
-                    f"Error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}, appending to failed documents list"
-                )
-                failed_documents.append(document)
-
-            count += 1
-
-            if count % 1000 == 0:
-                logger.info(
-                    f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} ({count}/{total} documents)"
-                )
-
-        if g.config["sync"]["delete_documents_not_in_source"] == "true":
-            g.destination_db[destination_database][destination_collection].delete_many(
-                {g.flags.not_found_in_source: True}
-            )
-            g.destination_db[destination_database][destination_collection].update_many(
-                {},
-                {"$unset": {g.flags.not_found_in_source: ""}},
-            )
-
-        if len(failed_documents) > 0:
             logger.info(
-                f"Processing {source_database}.{source_collection} to {destination_database}.{destination_collection} failed documents"
+                f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}"
             )
 
-            for document in failed_documents:
+            if g.config["sync"]["delete_documents_not_in_source"] == "true":
+                g.destination_db[destination_database][destination_collection].update_many(
+                    {},
+                    {"$set": {g.flags.not_found_in_source: True}},
+                )
+
+            source_cursor = g.source_db[source_database][source_collection].find()
+            for document in source_cursor:
                 try:
                     g.destination_db[destination_database][
                         destination_collection
@@ -264,13 +231,53 @@ def sync_worker():
                     )
                 except:
                     logger.error(
-                        f"Still error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}"
+                        f"Error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}, appending to failed documents list"
+                    )
+                    failed_documents.append(document)
+
+                count += 1
+
+                if count % 1000 == 0:
+                    logger.info(
+                        f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} ({count}/{total} documents)"
                     )
 
-        g.full_sync_left_collections -= 1
-        logger.info(
-            f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} complete ({count} documents)"
-        )
+            if g.config["sync"]["delete_documents_not_in_source"] == "true":
+                g.destination_db[destination_database][destination_collection].delete_many(
+                    {g.flags.not_found_in_source: True}
+                )
+                g.destination_db[destination_database][destination_collection].update_many(
+                    {},
+                    {"$unset": {g.flags.not_found_in_source: ""}},
+                )
+
+            if len(failed_documents) > 0:
+                logger.info(
+                    f"Processing {source_database}.{source_collection} to {destination_database}.{destination_collection} failed documents"
+                )
+
+                for document in failed_documents:
+                    try:
+                        g.destination_db[destination_database][
+                            destination_collection
+                        ].replace_one(
+                            {"_id": document["_id"]},
+                            document,
+                            upsert=True,
+                        )
+                    except:
+                        logger.error(
+                            f"Still error syncing document {document['_id']} from {source_database}.{source_collection} to {destination_database}.{destination_collection}"
+                        )
+
+            g.full_sync_left_collections -= 1
+            logger.info(
+                f"Syncing {source_database}.{source_collection} to {destination_database}.{destination_collection} complete ({count} documents)"
+            )
+        except Exception as e:
+            g.full_sync_queue.put(work)
+            logger.error(f"Error syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}, put back to queue")
+            logger.error(e)
 
 
 def full_sync():
