@@ -48,11 +48,13 @@ def parse_args():
     )
     return parser.parse_args()
 
+
 def get_database_and_collection_from_mapping(mapping):
     database = mapping.split(".")[0]
     collection = mapping.split(".")[1:]
     collection = ".".join(collection)
     return database, collection
+
 
 def read_config(path):
     logger.info(f"Reading configuration from {path}")
@@ -105,10 +107,7 @@ def init_mapping():
             sys.exit(1)
     else:
         for key in g.config["mapping"]:
-            if (
-                len(key.split(".")) < 2
-                or len(g.config["mapping"][key].split(".")) < 2
-            ):
+            if len(key.split(".")) < 2 or len(g.config["mapping"][key].split(".")) < 2:
                 logger.error(f"Invalid mapping configuration for {key}")
                 sys.exit(1)
 
@@ -116,6 +115,8 @@ def init_mapping():
                 for collection in g.source_db[
                     key.split(".")[0]
                 ].list_collection_names():
+                    if collection.split(".")[0] == "system":
+                        continue
                     g.mapping[key.split(".")[0] + "." + collection] = (
                         g.config["mapping"][key].split(".")[0] + "." + collection
                     )
@@ -297,8 +298,12 @@ def full_sync():
     g.full_sync_total_collections = len(g.mapping)
     g.full_sync_left_collections = len(g.mapping)
     for collection in g.mapping:
-        source_database, source_collection = get_database_and_collection_from_mapping(collection)
-        destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[collection])
+        source_database, source_collection = get_database_and_collection_from_mapping(
+            collection
+        )
+        destination_database, destination_collection = (
+            get_database_and_collection_from_mapping(g.mapping[collection])
+        )
         g.full_sync_queue.put(
             {
                 "source_database": source_database,
@@ -433,8 +438,14 @@ def oplog_sync():
         if source_database_collection not in g.mapping:
             continue
 
-        source_database, source_collection = get_database_and_collection_from_mapping(source_database_collection)
-        destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[source_database_collection])
+        source_database, source_collection = get_database_and_collection_from_mapping(
+            source_database_collection
+        )
+        destination_database, destination_collection = (
+            get_database_and_collection_from_mapping(
+                g.mapping[source_database_collection]
+            )
+        )
 
         if oplog["op"] == "i":
             g.destination_db[destination_database][destination_collection].replace_one(
@@ -468,8 +479,12 @@ def sync():
         logger.info("Mirroring indexes")
 
         for collection in g.mapping:
-            source_database, source_collection = get_database_and_collection_from_mapping(collection)
-            destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[collection])
+            source_database, source_collection = (
+                get_database_and_collection_from_mapping(collection)
+            )
+            destination_database, destination_collection = (
+                get_database_and_collection_from_mapping(g.mapping[collection])
+            )
 
             mirror_indexes(
                 source_database,
