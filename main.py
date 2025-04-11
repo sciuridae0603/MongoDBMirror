@@ -48,6 +48,11 @@ def parse_args():
     )
     return parser.parse_args()
 
+def get_database_and_collection_from_mapping(mapping):
+    database = mapping.split(".")[0]
+    collection = mapping.split(".")[1:]
+    collection = ".".join(collection)
+    return database, collection
 
 def read_config(path):
     logger.info(f"Reading configuration from {path}")
@@ -101,8 +106,8 @@ def init_mapping():
     else:
         for key in g.config["mapping"]:
             if (
-                len(key.split(".")) != 2
-                or len(g.config["mapping"][key].split(".")) != 2
+                len(key.split(".")) < 2
+                or len(g.config["mapping"][key].split(".")) < 2
             ):
                 logger.error(f"Invalid mapping configuration for {key}")
                 sys.exit(1)
@@ -196,9 +201,9 @@ def sync_worker():
             break
 
         work = g.full_sync_queue.get()
-        
+
         try:
-    
+
             failed_documents = []
 
             source_database = work["source_database"]
@@ -214,7 +219,9 @@ def sync_worker():
             )
 
             if g.config["sync"]["delete_documents_not_in_source"] == "true":
-                g.destination_db[destination_database][destination_collection].update_many(
+                g.destination_db[destination_database][
+                    destination_collection
+                ].update_many(
                     {},
                     {"$set": {g.flags.not_found_in_source: True}},
                 )
@@ -243,10 +250,12 @@ def sync_worker():
                     )
 
             if g.config["sync"]["delete_documents_not_in_source"] == "true":
-                g.destination_db[destination_database][destination_collection].delete_many(
-                    {g.flags.not_found_in_source: True}
-                )
-                g.destination_db[destination_database][destination_collection].update_many(
+                g.destination_db[destination_database][
+                    destination_collection
+                ].delete_many({g.flags.not_found_in_source: True})
+                g.destination_db[destination_database][
+                    destination_collection
+                ].update_many(
                     {},
                     {"$unset": {g.flags.not_found_in_source: ""}},
                 )
@@ -276,7 +285,9 @@ def sync_worker():
             )
         except Exception as e:
             g.full_sync_queue.put(work)
-            logger.error(f"Error syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}, put back to queue")
+            logger.error(
+                f"Error syncing {source_database}.{source_collection} to {destination_database}.{destination_collection}, put back to queue"
+            )
             logger.error(e)
 
 
@@ -286,12 +297,14 @@ def full_sync():
     g.full_sync_total_collections = len(g.mapping)
     g.full_sync_left_collections = len(g.mapping)
     for collection in g.mapping:
+        source_database, source_collection = get_database_and_collection_from_mapping(collection)
+        destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[collection])
         g.full_sync_queue.put(
             {
-                "source_database": collection.split(".")[0],
-                "source_collection": collection.split(".")[1],
-                "destination_database": g.mapping[collection].split(".")[0],
-                "destination_collection": g.mapping[collection].split(".")[1],
+                "source_database": source_database,
+                "source_collection": source_collection,
+                "destination_database": destination_database,
+                "destination_collection": destination_collection,
             }
         )
 
@@ -344,7 +357,18 @@ def get_oplogs():
         )
         for oplog in oplogs:
             oplog["ts"] = convert_bson_timestamp_to_milliseconds(oplog["ts"])
-        return oplogs
+
+        last_oplog = oplogs[-1]
+
+        filtered_oplogs = []
+        for oplog in oplogs:
+            if oplog["ns"] in g.mapping:
+                filtered_oplogs.append(oplog)
+
+        if len(filtered_oplogs) == 0:
+            filtered_oplogs.append(last_oplog)
+
+        return filtered_oplogs
     except Exception as e:
         logger.error(f"Error reading oplog: {e}")
         return None
@@ -385,12 +409,14 @@ def oplog_puller():
     t.daemon = True
     t.start()
 
+
 def oplog_monitor():
     while True:
         if not g.oplog_sync_queue.empty():
             logger.info(f"Oplog Queue : {g.oplog_sync_queue.qsize()}")
         time.sleep(1)
-        
+
+
 def oplog_sync():
     monitor_thread = threading.Thread(target=oplog_monitor)
     monitor_thread.daemon = True
@@ -407,10 +433,8 @@ def oplog_sync():
         if source_database_collection not in g.mapping:
             continue
 
-        source_database = source_database_collection.split(".")[0]
-        source_collection = source_database_collection.split(".")[1]
-        destination_database = g.mapping[source_database_collection].split(".")[0]
-        destination_collection = g.mapping[source_database_collection].split(".")[1]
+        source_database, source_collection = get_database_and_collection_from_mapping(source_database_collection)
+        destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[source_database_collection])
 
         if oplog["op"] == "i":
             g.destination_db[destination_database][destination_collection].replace_one(
@@ -444,10 +468,8 @@ def sync():
         logger.info("Mirroring indexes")
 
         for collection in g.mapping:
-            source_database = collection.split(".")[0]
-            source_collection = collection.split(".")[1]
-            destination_database = g.mapping[collection].split(".")[0]
-            destination_collection = g.mapping[collection].split(".")[1]
+            source_database, source_collection = get_database_and_collection_from_mapping(collection)
+            destination_database, destination_collection = get_database_and_collection_from_mapping(g.mapping[collection])
 
             mirror_indexes(
                 source_database,
