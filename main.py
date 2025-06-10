@@ -6,6 +6,7 @@ import sys
 import threading
 import queue
 import json
+import math
 from bson import Timestamp
 from jsondiff import diff as jsondiff
 from loguru import logger
@@ -343,19 +344,18 @@ def save_last_oplog(oplog):
         logger.error(f"Error saving last optime: {e}")
 
 
-def get_oplogs():
+def get_oplogs(start_time, end_time):
+    start_time = convert_milliseconds_to_bson_timestamp(start_time)
+    end_time = convert_milliseconds_to_bson_timestamp(end_time)
+
     try:
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
                 {
                     "op": {"$in": ["i", "u", "d", "n"]},
                     "ts": {
-                        "$gte": Timestamp(
-                            int((g.last_processed_oplog_timestamp / 1000) - 60 * 10), 0
-                        ),
-                        "$lte": Timestamp(
-                            int((g.last_processed_oplog_timestamp / 1000) + 60 * 10), 0
-                        ),
+                        "$gte": start_time,
+                        "$lte": end_time,
                     },
                 },
             )
@@ -363,17 +363,7 @@ def get_oplogs():
         for oplog in oplogs:
             oplog["ts"] = convert_bson_timestamp_to_milliseconds(oplog["ts"])
 
-        last_oplog = oplogs[-1]
-
-        filtered_oplogs = []
-        for oplog in oplogs:
-            if oplog["ns"] in g.mapping:
-                filtered_oplogs.append(oplog)
-
-        if len(filtered_oplogs) == 0:
-            filtered_oplogs.append(last_oplog)
-
-        return filtered_oplogs
+        return oplogs
     except Exception as e:
         logger.error(f"Error reading oplog: {e}")
         return None
@@ -383,12 +373,18 @@ def convert_bson_timestamp_to_milliseconds(timestamp):
     return timestamp.time * 1000 + timestamp.inc
 
 
+def convert_milliseconds_to_bson_timestamp(milliseconds):
+    return Timestamp(int(milliseconds / 1000), int(milliseconds % 1000))
+
+
 def oplog_outdated():
     if g.last_processed_oplog_timestamp == None:
         g.last_processed_oplog_timestamp = time.time() * 1000
         return True
 
-    oplogs = get_oplogs()
+    oplogs = get_oplogs(
+        g.last_processed_oplog_timestamp, g.last_processed_oplog_timestamp
+    )
 
     for oplog in oplogs:
         if oplog["ts"] == g.last_processed_oplog_timestamp:
@@ -400,12 +396,28 @@ def oplog_outdated():
 def oplog_puller():
     def oplog_puller_worker():
         while True:
-            oplogs = get_oplogs()
+            start_time = g.last_processed_oplog_timestamp
+            end_time = min(
+                g.last_processed_oplog_timestamp + (1000 * 60 * 60), time.time() * 1000
+            )
+            logger.info(
+                f"Getting oplogs from {str(start_time)} to {str(end_time)}, last processed timestamp is {str(g.last_processed_oplog_timestamp)}"
+            )
+
+            oplogs = get_oplogs(start_time, end_time)
+            count = 0
             for oplog in oplogs:
-                if oplog["ts"] > g.last_processed_oplog_timestamp:
+                if (
+                    oplog["ts"] > g.last_processed_oplog_timestamp
+                    and oplog["ns"] in g.mapping
+                ):
+                    count += 1
                     g.oplog_sync_queue.put(oplog)
 
             g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
+            logger.info(
+                f"Got {count} oplogs, updating last processed timestamp to {str(g.last_processed_oplog_timestamp)}"
+            )
             save_last_oplog(oplogs[-1])
 
             time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
