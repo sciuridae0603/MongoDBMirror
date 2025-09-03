@@ -29,7 +29,7 @@ class GlobalVariables:
         self.full_sync_queue = queue.Queue()
         self.full_sync_total_collections = 0
         self.full_sync_left_collections = 0
-        self.oplog_sync_queue = queue.Queue()
+        self.oplog_sync_queue = queue.Queue(maxsize=1024)
         self.last_processed_oplog_timestamp = None
 
 
@@ -400,11 +400,16 @@ def oplog_puller():
             end_time = min(
                 g.last_processed_oplog_timestamp + (1000 * 60 * 60), time.time() * 1000
             )
+            # Backtracking means the end time is less than 1.5 times the interval ago
+            backtracking = end_time < time.time() * 1000 - (
+                int(g.config["sync"]["oplog_pull_interval"]) * 1.5 * 1000
+            )
             logger.info(
                 f"Getting oplogs from {str(start_time)} to {str(end_time)}, last processed timestamp is {str(g.last_processed_oplog_timestamp)}"
             )
 
             oplogs = get_oplogs(start_time, end_time)
+
             count = 0
             for oplog in oplogs:
                 if (
@@ -414,13 +419,22 @@ def oplog_puller():
                     count += 1
                     g.oplog_sync_queue.put(oplog)
 
-            g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
-            logger.info(
-                f"Got {count} oplogs, updating last processed timestamp to {str(g.last_processed_oplog_timestamp)}"
-            )
-            save_last_oplog(oplogs[-1])
+            if backtracking and count == 0:
+                logger.info(
+                    f"No oplogs found in backtracking. Advancing timestamp to {str(end_time)}"
+                )
+                g.last_processed_oplog_timestamp = end_time
+                save_last_oplog({"ts": end_time})
+                continue
+            else:
+                g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
+                logger.info(
+                    f"Got {count} oplogs, updating last processed timestamp to {str(g.last_processed_oplog_timestamp)}"
+                )
+                save_last_oplog(oplogs[-1])
 
-            time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
+            if not backtracking:
+                time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
 
     t = threading.Thread(target=oplog_puller_worker)
     t.daemon = True
