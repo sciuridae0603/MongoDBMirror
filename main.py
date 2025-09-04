@@ -25,6 +25,7 @@ class GlobalVariables:
         self.mapping = {}
         self.source_db = None
         self.destination_db = None
+        self.log_collection = None
 
         self.full_sync_queue = queue.Queue()
         self.full_sync_total_collections = 0
@@ -93,6 +94,18 @@ def connect_to_mongodb():
         logger.error(f"Error connecting to destination MongoDB: {e}")
         logger.error(e)
         sys.exit(1)
+
+    if g.config["log_to_database"]["enabled"] == "true":
+        logger.info("Connecting to log database...")
+        try:
+            g.log_collection = pymongo.MongoClient(g.config["log_to_database"]["uri"])[
+                g.config["log_to_database"]["database"]
+            ][g.config["log_to_database"]["collection"]]
+            logger.info("Connected to log database")
+        except Exception as e:
+            logger.error(f"Error connecting to log database: {e}")
+            logger.error(e)
+            sys.exit(1)
 
 
 def init_mapping():
@@ -448,6 +461,24 @@ def oplog_monitor():
     while True:
         if not g.oplog_sync_queue.empty():
             logger.info(f"Oplog Queue : {g.oplog_sync_queue.qsize()}")
+
+        if g.log_collection:
+            g.log_collection.update_one(
+                {"mirror_key": g.config["log_to_database"]["mirror_key"]},
+                {
+                    "$set": {
+                        "current_time": time.time() * 1000,
+                        "oplog_queue_size": g.oplog_sync_queue.qsize(),
+                        "last_processed_oplog_timestamp": (
+                            str(g.last_processed_oplog_timestamp)
+                            if g.last_processed_oplog_timestamp
+                            else None
+                        ),
+                    }
+                },
+                upsert=True,
+            )
+
         time.sleep(1)
 
 
