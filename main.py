@@ -36,6 +36,7 @@ class GlobalVariables:
 g = GlobalVariables()
 
 SYSTEM_DATABASES = ["admin", "config", "local"]
+QUEUE_SKIP_INTERVAL_MAX_SIZE = 512
 
 
 def parse_args():
@@ -424,7 +425,6 @@ def oplog_puller():
                     f"No oplogs found in backtracking. Advancing timestamp to {str(end_time)}"
                 )
                 g.last_processed_oplog_timestamp = end_time
-                save_last_oplog({"ts": end_time})
                 continue
             else:
                 g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
@@ -433,7 +433,10 @@ def oplog_puller():
                 )
                 save_last_oplog(oplogs[-1])
 
-            if not backtracking:
+            if (
+                not backtracking
+                or g.oplog_sync_queue.qsize() > QUEUE_SKIP_INTERVAL_MAX_SIZE
+            ):
                 time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
 
     t = threading.Thread(target=oplog_puller_worker)
