@@ -7,6 +7,7 @@ import threading
 import queue
 import json
 import math
+import subprocess
 from bson import Timestamp
 from jsondiff import diff as jsondiff
 from loguru import logger
@@ -95,17 +96,18 @@ def connect_to_mongodb():
         logger.error(e)
         sys.exit(1)
 
-    if g.config["log_to_database"]["enabled"] == "true":
-        logger.info("Connecting to log database...")
-        try:
-            g.log_collection = pymongo.MongoClient(g.config["log_to_database"]["uri"])[
-                g.config["log_to_database"]["database"]
-            ][g.config["log_to_database"]["collection"]]
-            logger.info("Connected to log database")
-        except Exception as e:
-            logger.error(f"Error connecting to log database: {e}")
-            logger.error(e)
-            sys.exit(1)
+    if g.config.has_section("monitor") and g.config["monitor"]["enabled"] == "true":
+        if g.config["monitor"]["type"] == "database":
+            logger.info("Connecting to log database...")
+            try:
+                g.log_collection = pymongo.MongoClient(g.config["monitor"]["uri"])[
+                    g.config["monitor"]["database"]
+                ][g.config["monitor"]["collection"]]
+                logger.info("Connected to log database")
+            except Exception as e:
+                logger.error(f"Error connecting to log database: {e}")
+                logger.error(e)
+                sys.exit(1)
 
 
 def init_mapping():
@@ -459,25 +461,55 @@ def oplog_puller():
 
 def oplog_monitor():
     while True:
-        if not g.oplog_sync_queue.empty():
-            logger.info(f"Oplog Queue : {g.oplog_sync_queue.qsize()}")
+        if g.config.has_section("monitor") and g.config["monitor"]["enabled"] == "true":
 
-        if g.log_collection:
-            g.log_collection.update_one(
-                {"mirror_key": g.config["log_to_database"]["mirror_key"]},
-                {
-                    "$set": {
-                        "current_time": time.time() * 1000,
-                        "oplog_queue_size": g.oplog_sync_queue.qsize(),
-                        "last_processed_oplog_timestamp": (
-                            str(g.last_processed_oplog_timestamp)
-                            if g.last_processed_oplog_timestamp
-                            else None
-                        ),
-                    }
-                },
-                upsert=True,
+            mirror_key = g.config["monitor"]["mirror_key"]
+            current_time = time.time() * 1000
+            oplog_queue_size = g.oplog_sync_queue.qsize()
+            last_processed_oplog_timestamp = (
+                str(g.last_processed_oplog_timestamp)
+                if g.last_processed_oplog_timestamp
+                else None
             )
+
+            if g.config["monitor"]["type"] == "database":
+                if g.log_collection:
+                    g.log_collection.update_one(
+                        {"mirror_key": mirror_key},
+                        {
+                            "$set": {
+                                "mirror_key": mirror_key,
+                                "current_time": current_time,
+                                "oplog_queue_size": oplog_queue_size,
+                                "last_processed_oplog_timestamp": last_processed_oplog_timestamp,
+                            }
+                        },
+                        upsert=True,
+                    )
+            elif g.config["monitor"]["type"] == "script":
+                command = g.config["monitor"]["command"]
+                if command:
+                    try:
+                        args = (
+                            command.split(" ")
+                            + [
+                                str(mirror_key),
+                                str(int(current_time)),
+                                str(oplog_queue_size),
+                                str(last_processed_oplog_timestamp) if last_processed_oplog_timestamp is not None else "",
+                            ]
+                        )
+                        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        stdout, stderr = process.communicate()
+                        if stdout:
+                            logger.info(f"Monitor script output: {stdout.decode('utf-8')}")
+                        if stderr:
+                            logger.error(f"Monitor script error: {stderr.decode('utf-8')}")
+                        process.wait()
+                    except FileNotFoundError:
+                        logger.error(f"Monitor script not found at {command}")
+                    except Exception as e:
+                        logger.error(f"Error executing monitor script: {e}")
 
         time.sleep(1)
 
