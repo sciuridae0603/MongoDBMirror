@@ -878,7 +878,13 @@ def apply_command_oplog(oplog):
             option: value for option, value in command.items() if option != "collMod"
         }
         logger.info(f"Modifying {destination_ns}: {options}")
-        destination.command("collMod", destination_collection, **options)
+        try:
+            destination.command("collMod", destination_collection, **options)
+        except OperationFailure as e:
+            if e.code != UNAUTHORIZED:
+                raise
+            # needs dbAdmin, which a readWrite user lacks; skip instead of blocking the oplog
+            logger.error(f"Skipping collMod on {destination_ns}, not authorized: {e}")
 
 
 def apply_view_oplog(oplog):
