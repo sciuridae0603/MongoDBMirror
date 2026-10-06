@@ -39,5 +39,20 @@ mirror_indexes=true
 # *=* : Sync all databases
 # src_db_1.*=dest_db_1.* : Sync all collections in src_db_1 to dest_db_1
 # src_db_2.data=dest_db_1.data_2 : Sync src_db_2.data to dest_db_1.data_2
+# Names are case sensitive
 *=*
 ```
+
+## What is mirrored
+
+- Documents, including transactions and batched writes
+- Collections and databases created, dropped or renamed while running
+  (new collections follow the `*=*` and `db.*` rules)
+- Indexes, views, capped, clustered and time series collections
+- Time series are mirrored at bucket level, so the source user needs read access
+  and the destination user needs write access to `system.buckets.*`
+
+The last applied oplog position is saved to `last_optime_file` only after the
+changes before it reach the destination, so a restart resumes without losing
+queued changes. If the oplog no longer covers that position, `auto` mode runs a
+full sync and the process exits if the oplog rolls over while mirroring.

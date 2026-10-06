@@ -5,7 +5,7 @@
 # 1. mirror_key
 # 2. current_time
 # 3. oplog_queue_size
-# 4. last_processed_oplog_timestamp
+# 4. last_processed_oplog_timestamp (ms, oplog time of the last applied and saved position)
 
 echo "Mirror Key: $1"
 echo "Current Time: $2"
