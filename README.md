@@ -14,6 +14,37 @@ destination can be any MongoDB deployment.
 - Source user: read access to the mirrored databases and to `local.oplog.rs`
 - Destination user: write access to the target databases
 
+See [Permissions](#permissions) for the exact roles.
+
+## Permissions
+
+| User | Role | Database | Why |
+|------|------|----------|-----|
+| Source | `readAnyDatabase` | `admin` | `listDatabases` (needed for `*=*`), `listCollections`, `find`, `listIndexes` |
+| Source | `read` | `local` | Read `local.oplog.rs`. `readAnyDatabase` does not cover `local` |
+| Destination | `readWriteAnyDatabase` | `admin` | Writes, create/drop collections and indexes, cross-database `renameCollection` |
+| Monitor (`type = database`) | `readWrite` | the monitor `database` | Upsert the status document |
+
+To narrow it down, use `read` on each mirrored source database instead of
+`readAnyDatabase`, and `readWrite` on each target database instead of
+`readWriteAnyDatabase`. A source rename across databases then needs
+`readWrite` on both destination databases.
+
+Time series are mirrored through `system.buckets.*`, and the built-in `read`
+and `readWrite` roles only document access to non-system collections. Check
+your version with `db.getRole("readWrite", {db: "<db>", showPrivileges: true})`.
+If the buckets are not covered, add a custom role granting `find` on
+`{db: "<db>", collection: "system.buckets.<name>"}` on the source, and `find`,
+`insert`, `update`, `remove`, `createCollection`, `createIndex` and
+`dropCollection` on the same resource on the destination.
+
+### Ops Manager
+
+When Ops Manager Automation manages authentication, create these users and
+custom roles under **Deployment → Security → MongoDB Users / MongoDB Roles**.
+Users created with `db.createUser` outside Ops Manager can be removed by
+Automation when it enforces a consistent set of users.
+
 ## Installation
 
 ```bash
