@@ -24,6 +24,8 @@ class GlobalVariables:
         self.config = None
         self.flags = Flags()
         self.mapping = {}
+        self.mirror_all = False
+        self.db_wildcards = {}  # source db -> destination db for "src.*=dst.*"
         self.source_db = None
         self.destination_db = None
         self.log_collection = None
@@ -114,6 +116,7 @@ def init_mapping():
     logger.info("Initializing mirror mapping...")
     if "*" in g.config["mapping"]:
         if g.config["mapping"]["*"] == "*":
+            g.mirror_all = True
             for database in g.source_db.list_database_names():
                 if database in SYSTEM_DATABASES:
                     continue
@@ -129,6 +132,9 @@ def init_mapping():
                 sys.exit(1)
 
             if key.split(".")[1] == "*":
+                g.db_wildcards[key.split(".")[0]] = g.config["mapping"][key].split(".")[
+                    0
+                ]
                 for collection in g.source_db[
                     key.split(".")[0]
                 ].list_collection_names():
@@ -139,6 +145,75 @@ def init_mapping():
                     )
             else:
                 g.mapping[key] = g.config["mapping"][key]
+
+
+def resolve_mapping(source_ns):
+    """Destination ns for a source ns, learning collections created after startup."""
+    if source_ns in g.mapping:
+        return g.mapping[source_ns]
+    database, collection = get_database_and_collection_from_mapping(source_ns)
+    if not collection or collection.startswith("system."):
+        return None
+    if g.mirror_all and database not in SYSTEM_DATABASES:
+        g.mapping[source_ns] = source_ns
+    elif database in g.db_wildcards:
+        g.mapping[source_ns] = g.db_wildcards[database] + "." + collection
+    else:
+        return None
+    logger.info(f"New collection {source_ns} mapped to {g.mapping[source_ns]}")
+    return g.mapping[source_ns]
+
+
+def oplog_in_scope(oplog):
+    if oplog["op"] != "c":
+        return resolve_mapping(oplog["ns"]) is not None
+    database = oplog["ns"].split(".")[0]
+    command = oplog["o"]
+    if "create" in command:
+        return resolve_mapping(database + "." + command["create"]) is not None
+    if "drop" in command:
+        return database + "." + command["drop"] in g.mapping
+    if "dropDatabase" in command:
+        return any(ns.split(".")[0] == database for ns in list(g.mapping))
+    return False
+
+
+def drop_destination(source_ns):
+    destination_database, destination_collection = (
+        get_database_and_collection_from_mapping(g.mapping[source_ns])
+    )
+    logger.info(
+        f"Dropping {destination_database}.{destination_collection} (source {source_ns} dropped)"
+    )
+    g.destination_db[destination_database].drop_collection(destination_collection)
+
+
+def apply_command_oplog(oplog):
+    database = oplog["ns"].split(".")[0]
+    command = oplog["o"]
+    if "create" in command:
+        destination_ns = resolve_mapping(database + "." + command["create"])
+        if destination_ns is None:
+            return
+        destination_database, destination_collection = (
+            get_database_and_collection_from_mapping(destination_ns)
+        )
+        options = {k: v for k, v in command.items() if k not in ("create", "idIndex")}
+        try:
+            g.destination_db[destination_database].create_collection(
+                destination_collection, **options
+            )
+            logger.info(f"Created {destination_ns}")
+        except pymongo.errors.CollectionInvalid:
+            pass  # already exists
+    elif "drop" in command:
+        source_ns = database + "." + command["drop"]
+        if source_ns in g.mapping:
+            drop_destination(source_ns)
+    elif "dropDatabase" in command:
+        for source_ns in list(g.mapping):
+            if source_ns.split(".")[0] == database:
+                drop_destination(source_ns)
 
 
 def mirror_indexes(
@@ -312,14 +387,16 @@ def sync_worker():
 def full_sync():
     logger.info("Starting full sync")
 
-    g.full_sync_total_collections = len(g.mapping)
-    g.full_sync_left_collections = len(g.mapping)
-    for collection in g.mapping:
+    # snapshot: the oplog puller may add newly created collections concurrently
+    mapping = dict(g.mapping)
+    g.full_sync_total_collections = len(mapping)
+    g.full_sync_left_collections = len(mapping)
+    for collection in mapping:
         source_database, source_collection = get_database_and_collection_from_mapping(
             collection
         )
         destination_database, destination_collection = (
-            get_database_and_collection_from_mapping(g.mapping[collection])
+            get_database_and_collection_from_mapping(mapping[collection])
         )
         g.full_sync_queue.put(
             {
@@ -368,7 +445,7 @@ def get_oplogs(start_time, end_time):
         oplogs = list(
             g.source_db["local"]["oplog.rs"].find(
                 {
-                    "op": {"$in": ["i", "u", "d", "n"]},
+                    "op": {"$in": ["i", "u", "d", "n", "c"]},
                     "ts": {
                         "$gte": start_time,
                         "$lte": end_time,
@@ -395,7 +472,8 @@ def convert_milliseconds_to_bson_timestamp(milliseconds):
 
 def oplog_outdated():
     if g.last_processed_oplog_timestamp == None:
-        g.last_processed_oplog_timestamp = time.time() * 1000
+        # whole second: the ms part would be read back as a BSON inc and skip ops in this second
+        g.last_processed_oplog_timestamp = int(time.time()) * 1000
         return True
 
     oplogs = get_oplogs(
@@ -425,12 +503,14 @@ def oplog_puller():
             )
 
             oplogs = get_oplogs(start_time, end_time)
+            if oplogs is None:  # read failed, retry the same window
+                time.sleep(int(g.config["sync"]["oplog_pull_interval"]))
+                continue
 
             count = 0
             for oplog in oplogs:
-                if (
-                    oplog["ts"] > g.last_processed_oplog_timestamp
-                    and oplog["ns"] in g.mapping
+                if oplog["ts"] > g.last_processed_oplog_timestamp and oplog_in_scope(
+                    oplog
                 ):
                     count += 1
                     g.oplog_sync_queue.put(oplog)
@@ -439,9 +519,10 @@ def oplog_puller():
                 logger.info(
                     f"No oplogs found in backtracking. Advancing timestamp to {str(end_time)}"
                 )
-                g.last_processed_oplog_timestamp = end_time
+                # floor to the second, same inc-vs-ms reason as oplog_outdated
+                g.last_processed_oplog_timestamp = int(end_time // 1000) * 1000
                 continue
-            else:
+            elif oplogs:
                 g.last_processed_oplog_timestamp = oplogs[-1]["ts"]
                 logger.info(
                     f"Got {count} oplogs, updating last processed timestamp to {str(g.last_processed_oplog_timestamp)}"
@@ -490,21 +571,28 @@ def oplog_monitor():
                 command = g.config["monitor"]["command"]
                 if command:
                     try:
-                        args = (
-                            command.split(" ")
-                            + [
-                                str(mirror_key),
-                                str(int(current_time)),
-                                str(oplog_queue_size),
-                                str(last_processed_oplog_timestamp) if last_processed_oplog_timestamp is not None else "",
-                            ]
+                        args = command.split(" ") + [
+                            str(mirror_key),
+                            str(int(current_time)),
+                            str(oplog_queue_size),
+                            (
+                                str(last_processed_oplog_timestamp)
+                                if last_processed_oplog_timestamp is not None
+                                else ""
+                            ),
+                        ]
+                        process = subprocess.Popen(
+                            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE
                         )
-                        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                         stdout, stderr = process.communicate()
                         if stdout:
-                            logger.info(f"Monitor script output: {stdout.decode('utf-8')}")
+                            logger.info(
+                                f"Monitor script output: {stdout.decode('utf-8')}"
+                            )
                         if stderr:
-                            logger.error(f"Monitor script error: {stderr.decode('utf-8')}")
+                            logger.error(
+                                f"Monitor script error: {stderr.decode('utf-8')}"
+                            )
                         process.wait()
                     except FileNotFoundError:
                         logger.error(f"Monitor script not found at {command}")
@@ -526,8 +614,12 @@ def oplog_sync():
 
         oplog = g.oplog_sync_queue.get()
 
+        if oplog["op"] == "c":
+            apply_command_oplog(oplog)
+            continue
+
         source_database_collection = oplog["ns"]
-        if source_database_collection not in g.mapping:
+        if resolve_mapping(source_database_collection) is None:
             continue
 
         source_database, source_collection = get_database_and_collection_from_mapping(
