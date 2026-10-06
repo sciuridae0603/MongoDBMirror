@@ -19,6 +19,7 @@ from pymongo.errors import (
     CollectionInvalid,
     ConnectionFailure,
     OperationFailure,
+    WriteError,
 )
 
 
@@ -59,6 +60,7 @@ COLLECTION_COMMANDS = (
     "createIndexes",
     "commitIndexBuild",
     "dropIndexes",
+    "collMod",
 )
 BATCH_SIZE = 1000  # documents per bulk write, oplogs per apply batch
 OPLOG_FETCH_LIMIT = 10000  # oplogs read per pull, bounds memory while catching up
@@ -67,6 +69,8 @@ RETRY_SECONDS = 5
 UNAUTHORIZED = 13
 NAMESPACE_NOT_FOUND = 26
 INDEX_NOT_FOUND = 27
+DOCUMENT_VALIDATION_FAILURE = 121
+DUPLICATE_KEY = 11000
 
 
 def parse_args():
@@ -100,7 +104,7 @@ def read_config(path):
         g.config.read(path)
 
         g.flags.not_found_in_source = (
-            g.config["sync"]["flag_perfix"] + "not_found_in_source"
+            g.config["sync"]["flag_prefix"] + "not_found_in_source"
         )
 
         logger.add(g.config["sync"]["log_file"])
@@ -315,7 +319,12 @@ def mirror_indexes(source_ns):
             destination.drop_index(index)
             while index in destination.index_information():
                 time.sleep(3)
-            create_index_from_spec(destination, spec)
+            try:
+                create_index_from_spec(destination, spec)
+            except OperationFailure as e:
+                logger.error(
+                    f"Error updating index {index} in {g.mapping[source_ns]}: {e}"
+                )
 
     # Append index that mirror tool needs (used when check destination document not exists in source)
     if (
@@ -367,7 +376,15 @@ def sync_collection(source_ns):
     logger.info(f"Syncing {source_ns} to {destination_ns}")
 
     if delete_missing and not is_buckets:
-        destination.update_many({}, {"$set": {flag: True}})
+        try:
+            destination.update_many({}, {"$set": {flag: True}})
+        except WriteError as e:
+            if e.code != DOCUMENT_VALIDATION_FAILURE:
+                raise
+            # a strict validator rejects the flag field
+            destination.update_many(
+                {}, {"$set": {flag: True}}, bypass_document_validation=True
+            )
 
     count = 0
     failed_documents = []
@@ -388,11 +405,6 @@ def sync_collection(source_ns):
         failed_documents += replace_documents(destination, batch)
         count += len(batch)
 
-    if failed_documents:
-        logger.info(f"Retrying {len(failed_documents)} failed documents of {source_ns}")
-        for document in replace_documents(destination, failed_documents):
-            logger.error(f"Still error syncing document {document['_id']}")
-
     if delete_missing:
         if is_buckets:
             stale = [
@@ -403,6 +415,12 @@ def sync_collection(source_ns):
             destination.delete_many({"_id": {"$in": stale}})
         else:
             destination.delete_many({flag: True})
+
+    # after deleting stale documents, which may hold unique values the failed ones need
+    if failed_documents:
+        logger.info(f"Retrying {len(failed_documents)} failed documents of {source_ns}")
+        for document in replace_documents(destination, failed_documents):
+            logger.error(f"Still error syncing document {document['_id']}")
 
     logger.info(f"Syncing {source_ns} to {destination_ns} complete ({count} documents)")
 
@@ -438,6 +456,11 @@ def full_sync(namespaces):
 
     g.full_sync_queue.join()
     logger.info("Full sync complete")
+
+    # retry indexes that stale documents blocked before the sync deleted them
+    if g.config["sync"]["mirror_indexes"] == "true":
+        for source_ns in namespaces:
+            mirror_indexes(source_ns)
 
 
 def read_last_oplog():
@@ -669,18 +692,38 @@ def id_key(value):
     return bson.encode({"_id": value})
 
 
-def write_in_order(collection, requests):
+def write_in_order(collection, requests, source):
     """Ordered bulk write that skips a failing write instead of dropping the rest."""
+    refreshed = set()
     while requests:
         try:
             collection.bulk_write(requests, ordered=True)
             return
         except BulkWriteError as e:
             error = e.details["writeErrors"][0]
+            index = error["index"]
+            conflict = None
+            if error["code"] == DUPLICATE_KEY and "keyValue" in error:
+                conflict = collection.find_one(error["keyValue"], {"_id": 1})
+            if conflict and id_key(conflict["_id"]) not in refreshed:
+                # writing current documents can collide with one whose change is not applied yet
+                # (e.g. two documents swapped a unique value), so bring that one up to date around it
+                refreshed.add(id_key(conflict["_id"]))
+                current = source.find_one({"_id": conflict["_id"]})
+                requests = (
+                    [DeleteOne({"_id": conflict["_id"]}), requests[index]]
+                    + (
+                        [ReplaceOne({"_id": current["_id"]}, current, upsert=True)]
+                        if current
+                        else []
+                    )
+                    + requests[index + 1 :]
+                )
+                continue
             logger.error(
                 f"Skipping oplog write on {collection.full_name}: {error['errmsg']}"
             )
-            requests = requests[error["index"] + 1 :]
+            requests = requests[index + 1 :]
 
 
 def apply_document_oplogs(oplogs):
@@ -696,13 +739,12 @@ def apply_document_oplogs(oplogs):
         get_database_and_collection_from_mapping(destination_ns)
     )
 
+    source = g.source_db[source_database][source_collection]
     # updates are hard to parse, so replace with the current source document
     updated_ids = [oplog["o2"]["_id"] for oplog in oplogs if oplog["op"] == "u"]
     current = {}
     if updated_ids:
-        for document in g.source_db[source_database][source_collection].find(
-            {"_id": {"$in": updated_ids}}
-        ):
+        for document in source.find({"_id": {"$in": updated_ids}}):
             current[id_key(document["_id"])] = document
 
     requests = []
@@ -727,7 +769,9 @@ def apply_document_oplogs(oplogs):
             requests.append(DeleteOne({"_id": oplog["o"]["_id"]}))
 
     write_in_order(
-        g.destination_db[destination_database][destination_collection], requests
+        g.destination_db[destination_database][destination_collection],
+        requests,
+        source,
     )
 
 
@@ -826,6 +870,15 @@ def apply_command_oplog(oplog):
         except OperationFailure as e:
             if e.code != INDEX_NOT_FOUND:
                 raise
+    elif key == "collMod":
+        if destination_collection.startswith(BUCKETS_PREFIX):
+            # a time series is modified through its own name
+            destination_collection = destination_collection[len(BUCKETS_PREFIX) :]
+        options = {
+            option: value for option, value in command.items() if option != "collMod"
+        }
+        logger.info(f"Modifying {destination_ns}: {options}")
+        destination.command("collMod", destination_collection, **options)
 
 
 def apply_view_oplog(oplog):
@@ -902,6 +955,7 @@ def sync():
     oplog_sync()
 
 
+@logger.catch(onerror=lambda _: sys.exit(1))
 def main():
     g.args = parse_args()
     read_config(g.args.config)

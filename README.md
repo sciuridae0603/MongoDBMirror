@@ -89,10 +89,10 @@ as `true`; anything else counts as false.
 | `oplog_pull_interval` | Seconds to wait between oplog pulls once caught up |
 | `mirror_indexes` | `true` to copy index definitions to the destination |
 | `delete_documents_not_in_source` | `true` to delete destination documents that are not in the source during full sync |
-| `flag_perfix` | Prefix of the temporary marker field used by `delete_documents_not_in_source` (the key is spelled `perfix`) |
+| `flag_prefix` | Prefix of the temporary marker field used by `delete_documents_not_in_source` |
 
 `delete_documents_not_in_source` works by setting a
-`<flag_perfix>not_found_in_source` field on every destination document, then
+`<flag_prefix>not_found_in_source` field on every destination document, then
 deleting the documents the copy did not overwrite. Pick a prefix that does not
 clash with your own fields.
 
@@ -146,8 +146,13 @@ order, and its output is logged; see
 - Collections and databases created, dropped or renamed while running
   (new collections follow the `*=*` and `db.*` rules)
 - Indexes, views, capped, clustered and time series collections
+- Collection and index options changed with `collMod` (validators, TTL,
+  hidden indexes)
 - Time series are mirrored at bucket level, so the source user needs read access
   and the destination user needs write access to `system.buckets.*`
+- With `delete_documents_not_in_source`, destination collections whose
+  validator rejects the flag field are flagged with `bypassDocumentValidation`,
+  which the destination user needs for them
 
 ## Resuming and failures
 
