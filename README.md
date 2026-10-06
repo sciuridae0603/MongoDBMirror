@@ -1,47 +1,113 @@
 # MongoDB Mirror Tool
 
-(Currently only source only support replication set)
+Mirrors databases and collections from one MongoDB deployment to another. It
+does a full copy first, then keeps the destination up to date by replaying the
+source oplog.
+
+The source must be a replica set, since the tool reads `local.oplog.rs`. The
+destination can be any MongoDB deployment.
+
+## Requirements
+
+- Python 3.9
+- [Pipenv](https://pipenv.pypa.io/)
+- Source user: read access to the mirrored databases and to `local.oplog.rs`
+- Destination user: write access to the target databases
+
+## Installation
+
+```bash
+pipenv install
+```
 
 ## Usage
 
-```bash 
-python main.py -c confs/example.conf
+```bash
+cp confs/example.conf confs/my.conf   # confs/* is git-ignored, except the example
+mkdir -p logs
+pipenv run python main.py -c confs/my.conf
 ```
 
-## Config
+In `oplog` and `auto` mode the process runs until it is stopped. Run it under a
+supervisor such as systemd so it restarts after it exits (see
+[Resuming and failures](#resuming-and-failures)).
+
+## Sync modes
+
+| Mode    | Behavior |
+|---------|----------|
+| `full`  | Copies every mapped collection once, then exits. |
+| `oplog` | Replays the oplog from the saved position. With no saved position, or one the oplog no longer covers, it starts from now and logs a warning, so earlier changes are missing. |
+| `auto`  | Same as `oplog`, but when the saved position is missing or outdated it runs a full sync first. Oplog pulling starts before the full sync, so writes made during the copy are replayed afterwards. Recommended. |
+
+## Configuration
+
+See [`confs/example.conf`](confs/example.conf). Boolean values must be written
+as `true`; anything else counts as false.
+
+### `[sync]`
+
+| Key | Description |
+|-----|-------------|
+| `mode` | `full`, `oplog` or `auto` (see [Sync modes](#sync-modes)) |
+| `source_uri` | Source replica set connection string |
+| `destination_uri` | Destination connection string |
+| `last_optime_file` | File storing the last applied oplog position |
+| `log_file` | Log file path. Logs are also written to stderr. |
+| `threads` | Number of collections copied in parallel during full sync |
+| `oplog_pull_interval` | Seconds to wait between oplog pulls once caught up |
+| `mirror_indexes` | `true` to copy index definitions to the destination |
+| `delete_documents_not_in_source` | `true` to delete destination documents that are not in the source during full sync |
+| `flag_perfix` | Prefix of the temporary marker field used by `delete_documents_not_in_source` (the key is spelled `perfix`) |
+
+`delete_documents_not_in_source` works by setting a
+`<flag_perfix>not_found_in_source` field on every destination document, then
+deleting the documents the copy did not overwrite. Pick a prefix that does not
+clash with your own fields.
+
+### `[mapping]`
+
+One rule per line, `source=destination`. Names are case sensitive.
+
 ```ini
-[sync]
-# Sync mode, available values:
-# full : Mirror the data from the source to the destination
-# oplog : Only mirror operations from oplog
-# auto : If oplog outdated, will sync full data then switch to oplog
-mode=auto
-# Last optime file
-last_optime_file=logs/example.optime
-# Log file
-log_file=logs/example.log
-# Number of threads (only used in full sync)
-threads=8
-# Source URI
-source_uri=mongodb://user:user@localhost:27001/?authMechanism=DEFAULT&authSource=admin
-# Destination URI
-destination_uri=mongodb://127.0.0.1:27000
-# Field prefix for the flag (currently only used delete documents not in source)
-flag_perfix=mongodb_mirror_
-# Enable delete documents not in source
-delete_documents_not_in_source=true
-# Interval for pulling oplog (in seconds)
-oplog_pull_interval=1
-# Enable mirror indexes
-mirror_indexes=true
-
-[mapping]
-# *=* : Sync all databases
-# src_db_1.*=dest_db_1.* : Sync all collections in src_db_1 to dest_db_1
-# src_db_2.data=dest_db_1.data_2 : Sync src_db_2.data to dest_db_1.data_2
-# Names are case sensitive
+# Mirror every non-system database under the same names
 *=*
+
+# All collections in src_db_1 into dest_db_1, including collections created later
+src_db_1.*=dest_db_1.*
+
+# A single collection under a new name
+src_db_2.data=dest_db_1.data_2
 ```
+
+When `*=*` is present, every other rule is ignored, and `*` can only map to `*`. The `admin`, `config` and `local` databases are never mirrored.
+
+### `[monitor]` (optional)
+
+Reports the mirror status every second while oplog mirroring runs.
+
+| Key | Description |
+|-----|-------------|
+| `enabled` | `true` to turn monitoring on |
+| `type` | `database` or `script` |
+| `mirror_key` | Name identifying this mirror instance |
+| `uri`, `database`, `collection` | Where to write the status (`database` type) |
+| `command` | Command to run (`script` type) |
+
+The status contains:
+
+| Field | Description |
+|-------|-------------|
+| `mirror_key` | The configured key |
+| `current_time` | Current time in milliseconds |
+| `oplog_queue_size` | Oplog entries pulled but not yet applied |
+| `last_processed_oplog_timestamp` | Oplog time (milliseconds) of the last applied and saved position, empty before the first one |
+
+With `database`, one document per `mirror_key` is upserted into the collection.
+With `script`, the command is run with the four values as arguments in that
+order, and its output is logged; see
+[`monitor.example.sh`](monitor.example.sh). The replication lag is
+`current_time - last_processed_oplog_timestamp`.
 
 ## What is mirrored
 
@@ -52,7 +118,20 @@ mirror_indexes=true
 - Time series are mirrored at bucket level, so the source user needs read access
   and the destination user needs write access to `system.buckets.*`
 
-The last applied oplog position is saved to `last_optime_file` only after the
-changes before it reach the destination, so a restart resumes without losing
-queued changes. If the oplog no longer covers that position, `auto` mode runs a
-full sync and the process exits if the oplog rolls over while mirroring.
+## Resuming and failures
+
+- The last applied oplog position is saved to `last_optime_file` only after the
+  changes before it reach the destination, so a restart resumes without losing
+  queued changes.
+- If the source oplog rolls over past the position being pulled, changes are
+  lost and the process exits. Restart it in `auto` mode to run a full sync.
+  Size the source oplog to cover the longest expected downtime.
+- While replaying the oplog, connection and authorization errors are retried every 5 seconds. Other errors
+  on a single operation are logged and that operation is skipped, so check the
+  log for `Skipping` and `Error` lines.
+- To force a full resync, stop the process, delete `last_optime_file` and start
+  it in `auto` mode.
+
+## License
+
+See [LICENSE](LICENSE).
